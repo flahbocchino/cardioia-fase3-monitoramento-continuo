@@ -16,30 +16,33 @@
 DHT dht(DHTPIN, DHTTYPE);
 
 // ----- Configuração da fila de resiliência offline -----
-// Capacidade de 50 leituras (a cada 5s = ~4 minutos de buffer offline)
-// Wokwi não suporta SPIFFS persistente; RAM é a alternativa funcional
+// Escolha de projeto: armazenamos até 50 leituras em RAM enquanto offline.
+// Justificativa: em cenário de wearable cardíaco com leitura a cada 5s,
+// isso cobre ~4 minutos de desconexão antes de descartar dados antigos.
+// O Wokwi não suporta SPIFFS persistente, então a RAM é a alternativa
+// funcional e pedagogicamente equivalente para fins de simulação.
 const int FILA_MAX = 50;
 
+// Estrutura de uma leitura de sensor
 struct Leitura {
   float temperatura;
   float umidade;
   int bpm;
-  unsigned long timestamp_ms;
+  unsigned long timestamp_ms;  // milissegundos desde o boot
 };
 
-Leitura fila[FILA_MAX];
-int fila_inicio  = 0;
-int fila_fim     = 0;
-int fila_tamanho = 0;
+Leitura fila[FILA_MAX];  // Fila circular em RAM
+int fila_inicio = 0;     // Índice do registro mais antigo
+int fila_fim    = 0;     // Índice onde a próxima leitura será inserida
+int fila_tamanho = 0;    // Quantidade atual de registros na fila
 
 // ----- Simulação de conectividade Wi-Fi -----
+// Em produção real, isso seria substituído por WiFi.status() == WL_CONNECTED
 bool wifi_conectado = false;
 
 // ----- Contagem de batimentos (botão) -----
-int contagem_btn = 0;                      // Pressões na janela atual
-int ultimo_bpm_calculado = 0;              // CORRIGIDO: persiste o último BPM válido
-                                           // entre leituras, evitando BPM=0 espúrio
-unsigned long ultimo_calculo_bpm = 0;
+int contagem_btn = 0;             // Pressões no intervalo atual
+unsigned long ultimo_calculo_bpm = 0;  // Último momento em que BPM foi calculado
 const unsigned long JANELA_BPM_MS = 10000; // Janela de 10s para calcular BPM
 
 // Debounce do botão
@@ -59,6 +62,7 @@ const unsigned long INTERVALO_TOGGLE_MS = 30000;  // Alterna conexão a cada 30s
 // FUNÇÕES AUXILIARES — FILA CIRCULAR
 // =============================================================
 
+// Adiciona uma leitura na fila. Se cheia, descarta a mais antiga (FIFO)
 void fila_push(Leitura l) {
   fila[fila_fim] = l;
   fila_fim = (fila_fim + 1) % FILA_MAX;
@@ -66,16 +70,18 @@ void fila_push(Leitura l) {
   if (fila_tamanho < FILA_MAX) {
     fila_tamanho++;
   } else {
-    // Fila cheia: descarta o registro mais antigo
+    // Fila cheia: avança o início, descartando o registro mais antigo
     fila_inicio = (fila_inicio + 1) % FILA_MAX;
     Serial.println("[AVISO] Fila cheia. Registro mais antigo descartado.");
   }
 }
 
+// Verifica se há dados na fila
 bool fila_vazia() {
   return fila_tamanho == 0;
 }
 
+// Remove e retorna a leitura mais antiga da fila
 Leitura fila_pop() {
   Leitura l = fila[fila_inicio];
   fila_inicio = (fila_inicio + 1) % FILA_MAX;
@@ -84,13 +90,13 @@ Leitura fila_pop() {
 }
 
 // =============================================================
-// FUNÇÃO: Enviar leitura para a "nuvem" via Serial (simulação)
-// Na Parte 2 esta função será substituída pelo envio MQTT real
+// FUNÇÃO: Enviar uma leitura para a "nuvem" (Serial = simulação)
+// Na Parte 2, esta função será substituída pelo envio MQTT real
 // =============================================================
 void enviar_para_nuvem(Leitura l) {
   Serial.print("[NUVEM] T=");
   Serial.print(l.temperatura, 1);
-  Serial.print("C | U=");
+  Serial.print("°C | U=");
   Serial.print(l.umidade, 1);
   Serial.print("% | BPM=");
   Serial.print(l.bpm);
@@ -100,35 +106,35 @@ void enviar_para_nuvem(Leitura l) {
 }
 
 // =============================================================
-// FUNÇÃO: Sincronizar fila ao reconectar
+// FUNÇÃO: Sincronizar fila com a nuvem ao reconectar
 // =============================================================
 void sincronizar_fila() {
   if (fila_vazia()) return;
 
-  Serial.println(">>> [SYNC] Iniciando sincronizacao de dados offline...");
+  Serial.println(">>> [SYNC] Iniciando sincronização de dados offline...");
   Serial.print(">>> [SYNC] Registros pendentes: ");
   Serial.println(fila_tamanho);
 
   while (!fila_vazia()) {
     Leitura l = fila_pop();
     enviar_para_nuvem(l);
-    delay(50);
+    delay(50);  // Pequena pausa para não saturar a Serial
   }
 
-  Serial.println(">>> [SYNC] Sincronizacao concluida.");
+  Serial.println(">>> [SYNC] Sincronização concluída.");
 }
 
 // =============================================================
-// FUNÇÃO: Ler sensores
-// Usa ultimo_bpm_calculado — valor persistido da última janela fechada
+// FUNÇÃO: Ler sensores e retornar uma struct Leitura
 // =============================================================
-Leitura ler_sensores() {
+Leitura ler_sensores(int bpm_atual) {
   Leitura l;
-  l.temperatura  = dht.readTemperature();
-  l.umidade      = dht.readHumidity();
-  l.bpm          = ultimo_bpm_calculado;  // CORRIGIDO: sempre usa o último BPM válido
-  l.timestamp_ms = millis();
+  l.temperatura    = dht.readTemperature();
+  l.umidade        = dht.readHumidity();
+  l.bpm            = bpm_atual;
+  l.timestamp_ms   = millis();
 
+  // Validação básica do DHT22 (pode retornar NaN em falha)
   if (isnan(l.temperatura)) l.temperatura = -1.0;
   if (isnan(l.umidade))     l.umidade     = -1.0;
 
@@ -136,13 +142,13 @@ Leitura ler_sensores() {
 }
 
 // =============================================================
-// FUNÇÃO: Imprimir leitura local no Monitor Serial
+// FUNÇÃO: Imprimir leitura no Monitor Serial (sempre, online ou offline)
 // =============================================================
 void imprimir_leitura_local(Leitura l, bool offline) {
   Serial.print(offline ? "[OFFLINE] " : "[ONLINE]  ");
   Serial.print("T=");
   Serial.print(l.temperatura, 1);
-  Serial.print("C | U=");
+  Serial.print("°C | U=");
   Serial.print(l.umidade, 1);
   Serial.print("% | BPM=");
   Serial.print(l.bpm);
@@ -160,17 +166,16 @@ void setup() {
 
   dht.begin();
 
-  pinMode(BTN_PIN, INPUT_PULLUP);
+  pinMode(BTN_PIN, INPUT_PULLUP);  // Botão com resistor pull-up interno
   pinMode(LED_PIN, OUTPUT);
 
   Serial.println("==============================================");
   Serial.println("  CardioIA - Fase 3 | Edge Computing");
-  Serial.println("  ESP32 + DHT22 + Botao (BPM)");
+  Serial.println("  ESP32 + DHT22 + Botão (BPM)");
   Serial.println("==============================================");
   Serial.println("[INFO] Sistema iniciado. Wi-Fi: DESCONECTADO");
-  Serial.println("[INFO] Pressione o botao para simular batimentos.");
-  Serial.println("[INFO] Wi-Fi alterna automaticamente a cada 30s.");
-  Serial.println("[INFO] BPM calculado a cada 10s. Leitura a cada 5s.");
+  Serial.println("[INFO] Pressione o botão para simular batimentos.");
+  Serial.println("[INFO] O Wi-Fi alterna automaticamente a cada 30s.");
 
   ultimo_calculo_bpm = millis();
   ultima_leitura     = millis();
@@ -187,9 +192,11 @@ void loop() {
   bool btn_estado = digitalRead(BTN_PIN);
 
   if (btn_estado == LOW && btn_estado_anterior == HIGH) {
+    // Borda de descida: botão pressionado
     if ((agora - ultimo_debounce) > DEBOUNCE_MS) {
       contagem_btn++;
       ultimo_debounce = agora;
+      // Pulso no LED para feedback visual de cada batimento
       digitalWrite(LED_PIN, HIGH);
     }
   } else {
@@ -197,45 +204,48 @@ void loop() {
   }
   btn_estado_anterior = btn_estado;
 
-  // --- 2. Fechar janela de BPM a cada 10 segundos ---
-  // Quando a janela fecha, atualiza ultimo_bpm_calculado (persistente).
-  // As leituras de sensor seguintes usarão este valor até a próxima janela.
+  // --- 2. Calcular BPM ao fim da janela de 10 segundos ---
+  int bpm_calculado = 0;
   if ((agora - ultimo_calculo_bpm) >= JANELA_BPM_MS) {
-    ultimo_bpm_calculado = contagem_btn * 6;  // extrapola 10s → 1 minuto
-    contagem_btn         = 0;
-    ultimo_calculo_bpm   = agora;
-
-    Serial.print("[BPM]  Nova janela fechada. BPM calculado: ");
-    Serial.println(ultimo_bpm_calculado);
+    // BPM = pressões em 10s × 6 (extrapola para 1 minuto)
+    bpm_calculado    = contagem_btn * 6;
+    contagem_btn     = 0;
+    ultimo_calculo_bpm = agora;
   }
 
-  // --- 3. Leitura e processamento a cada 5 segundos ---
-  // Usa sempre ultimo_bpm_calculado, que persiste entre janelas
+  // --- 3. Leitura e processamento a cada INTERVALO_LEITURA_MS ---
   if ((agora - ultima_leitura) >= INTERVALO_LEITURA_MS) {
     ultima_leitura = agora;
 
-    Leitura leitura_atual = ler_sensores();
+    // Usa o BPM da última janela completa calculada
+    // (valor 0 indica que a janela ainda não fechou neste ciclo)
+    Leitura leitura_atual = ler_sensores(bpm_calculado);
+
+    // Imprime sempre no Serial (substitui SPIFFS em simulador)
     imprimir_leitura_local(leitura_atual, !wifi_conectado);
 
     if (wifi_conectado) {
+      // Conectado: envia direto para a nuvem
       enviar_para_nuvem(leitura_atual);
     } else {
+      // Desconectado: armazena na fila circular (Edge Computing)
       fila_push(leitura_atual);
       Serial.print("[FILA] Registros em espera: ");
       Serial.println(fila_tamanho);
     }
   }
 
-  // --- 4. Toggle simulado de Wi-Fi a cada 30 segundos ---
+  // --- 4. Toggle simulado de conectividade Wi-Fi a cada 30 segundos ---
   if ((agora - ultimo_toggle_wifi) >= INTERVALO_TOGGLE_MS) {
     ultimo_toggle_wifi = agora;
     wifi_conectado = !wifi_conectado;
 
     if (wifi_conectado) {
-      Serial.println("------ [WIFI] Conexao estabelecida ------");
+      Serial.println("------ [WIFI] Conexão estabelecida ------");
+      // Ao reconectar, sincroniza tudo que ficou na fila
       sincronizar_fila();
     } else {
-      Serial.println("------ [WIFI] Conexao perdida. Modo offline ------");
+      Serial.println("------ [WIFI] Conexão perdida. Modo offline ------");
     }
   }
 }
